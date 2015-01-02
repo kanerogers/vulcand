@@ -85,9 +85,16 @@ func (a *Address) Equals(o Address) bool {
 	return a.Network == o.Network && a.Address == o.Address
 }
 
+// Sets up OCSP stapling
+type StaplingSettings struct {
+	Period    string
+	Responder string // optional responder
+}
+
 type HostSettings struct {
-	KeyPair *KeyPair
-	Default bool
+	Default  bool
+	KeyPair  *KeyPair
+	Stapling *StaplingSettings
 }
 
 type HostKey struct {

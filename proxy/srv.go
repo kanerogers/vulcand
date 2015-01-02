@@ -2,7 +2,12 @@ package proxy
 
 import (
 	"crypto/tls"
+	"io/ioutil"
+
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
+	"golang.org/x/crypto/ocsp"
 	"net"
 	"net/http"
 
@@ -221,11 +226,11 @@ func newTLSConfig(keyPairs map[engine.HostKey]engine.KeyPair, defaultHost string
 
 	pairs := make(map[string]tls.Certificate, len(keyPairs))
 	for h, c := range keyPairs {
-		keyPair, err := tls.X509KeyPair(c.Cert, c.Key)
+		keyPair, err := initCert(&c)
 		if err != nil {
 			return nil, err
 		}
-		pairs[h.Name] = keyPair
+		pairs[h.Name] = *keyPair
 	}
 
 	config.Certificates = make([]tls.Certificate, 0, len(keyPairs))
@@ -322,4 +327,57 @@ func scopedHandler(scope string, proxy http.Handler) (http.Handler, error) {
 		return nil, err
 	}
 	return mux, nil
+}
+
+func initCert(c *engine.KeyPair) (*tls.Certificate, error) {
+	keyPair, err := tls.X509KeyPair(c.Cert, c.Key)
+	if err != nil {
+		return nil, err
+	}
+	if err := initStaple(&keyPair); err != nil {
+		return nil, err
+	}
+	return &keyPair, nil
+}
+
+func initStaple(cert *tls.Certificate) error {
+	xc, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return err
+	}
+
+	xi, err := x509.ParseCertificate(cert.Certificate[1])
+	if err != nil {
+		return err
+	}
+
+	ocspSrv := xc.OCSPServer[0]
+	data, err := ocsp.CreateRequest(xc, xi, &ocsp.RequestOptions{})
+	if err != nil {
+		return err
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+	client := &http.Client{}
+	httpReq, err := http.NewRequest("GET", ocspSrv+"/"+encoded, nil)
+	httpReq.Header.Add("Content-Language", "application/ocsp-request")
+	httpReq.Header.Add("Accept", "application/ocsp-response")
+	resp, err := client.Do(httpReq)
+
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	ocspResp, err := ocsp.ParseResponse(body, xi)
+	log.Infof("Got response: %v, err: %v", ocspResp, err)
+	if err != nil {
+		return err
+	}
+	log.Infof("OCSP Status: %v", ocspResp.Status)
+	if err := ocspResp.CheckSignatureFrom(xi); err != nil {
+		log.Errorf("OCSP signature check failed for %v, err: %v", err)
+		return nil
+	}
+	log.Infof("Got response: %v", ocspResp)
+	cert.OCSPStaple = body
+	return nil
 }
