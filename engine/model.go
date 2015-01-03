@@ -86,15 +86,15 @@ func (a *Address) Equals(o Address) bool {
 }
 
 // Sets up OCSP stapling
-type StaplingSettings struct {
+type OCSPSettings struct {
 	Period    string
 	Responder string // optional responder
 }
 
 type HostSettings struct {
-	Default  bool
-	KeyPair  *KeyPair
-	Stapling *StaplingSettings
+	Default bool
+	KeyPair *KeyPair
+	Staple  *OCSPSettings
 }
 
 type HostKey struct {
