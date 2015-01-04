@@ -91,10 +91,21 @@ type OCSPSettings struct {
 	Responder string // optional responder
 }
 
+func (o *OCSPSettings) RefreshPeriod() (time.Duration, error) {
+	if o.Period == "" {
+		return time.Hour, nil
+	}
+	return time.ParseDuration(o.Period)
+}
+
+func (o *OCSPSettings) Equals(other *OCSPSettings) bool {
+	return o.Period == other.Period && o.Responder == other.Responder
+}
+
 type HostSettings struct {
 	Default bool
 	KeyPair *KeyPair
-	Staple  *OCSPSettings
+	OCSP    *OCSPSettings
 }
 
 type HostKey struct {
