@@ -21,19 +21,103 @@ import (
 )
 
 type Stapler interface {
-	Staple(host *engine.Host) ([]byte, error)
+	StapleHost(host *engine.Host) ([]byte, error)
+	DeleteHost(host engine.HostKey)
 	Subscribe(chan *StapleUpdated, chan struct{})
-	Close() error
+	Close()
 }
 
 type stapler struct {
-	v            map[string]*hostStapler
-	mtx          *sync.Mutex
-	clock        timetools.TimeProvider
-	eventsC      chan *stapleFetched
-	cnt          int32
-	closeC       chan struct{}
-	subscribersC []chan *StapleUpdated
+	v           map[string]*hostStapler
+	mtx         *sync.Mutex
+	clock       timetools.TimeProvider
+	eventsC     chan *stapleFetched
+	cnt         int32
+	closeC      chan struct{}
+	subscribers map[int32]chan *StapleUpdated
+}
+
+func (s *stapler) StapleHost(host *engine.Host) (*StapleResponse, error) {
+	if host.Settings.KeyPair == nil {
+		return nil, fmt.Errorf("%v has no key pair to staple", host)
+	}
+	hs, found := s.getStapler(host)
+	if found {
+		return hs.response, nil
+	}
+	hs, err := newHostStapler(s, host)
+	if err != nil {
+		return nil, err
+	}
+	s.setStapler(host, hs)
+	return hs.response, nil
+}
+
+func (s *stapler) DeleteHost(hk engine.HostKey) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	hs, ok := s.v[hk.Name]
+	if !ok {
+		return
+	}
+	hs.stop()
+	delete(s.v, hk.Name)
+}
+
+func (s *stapler) Subscribe(in chan *StapleUpdated, closeC chan struct{}) {
+	myId := s.subscribe(in)
+	select {
+	case <-closeC:
+		s.unsubscribe(myId)
+	}
+}
+
+func (s *stapler) Close() {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	for key, hs := range s.v {
+		hs.stop()
+		delete(s.v, key)
+	}
+	close(s.eventsC)
+}
+
+func (s *stapler) subscribe(c chan *StapleUpdated) int32 {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	next := s.nextId()
+	s.subscribers[next] = c
+
+	return next
+}
+
+func (s *stapler) closeSubscribers() {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	for _, c := range s.subscribers {
+		close(c)
+	}
+}
+
+func (s *stapler) unsubscribe(id int32) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	delete(s.subscribers, id)
+}
+
+func (s *stapler) getSubscribers() []chan *StapleUpdated {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	out := make([]chan *StapleUpdated, 0, len(s.subscribers))
+	for _, c := range s.subscribers {
+		out = append(out, c)
+	}
+	return out
 }
 
 func (s *stapler) nextId() int32 {
@@ -140,26 +224,15 @@ func (s *stapler) updateStaple(e *stapleFetched) bool {
 	return true
 }
 
-func (s *stapler) Staple(host *engine.Host) (*StapleResponse, error) {
-	if host.Settings.KeyPair == nil {
-		return nil, fmt.Errorf("%v has no key pair to staple", host)
-	}
-	hs, found := s.getStapler(host)
-	if found {
-		return hs.response, nil
-	}
-	hs, err := newHostStapler(s, host)
-	if err != nil {
-		return nil, err
-	}
-	s.setStapler(host, hs)
-	return hs.response, nil
-}
-
 func (s *stapler) fanOut() {
 	select {
 	case e := <-s.eventsC:
 		log.Infof("%v got event %v", s, e)
+		if e == nil {
+			log.Infof("%v closed")
+			s.closeSubscribers()
+			return
+		}
 		if !s.updateStaple(e) {
 			log.Infof("%v event discarded")
 			return
@@ -169,7 +242,7 @@ func (s *stapler) fanOut() {
 			Staple:  e.re,
 			Err:     e.err,
 		}
-		for _, c := range s.subscribersC {
+		for _, c := range s.getSubscribers() {
 			select {
 			case c <- u:
 			default:
