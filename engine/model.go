@@ -87,8 +87,9 @@ func (a *Address) Equals(o Address) bool {
 
 // Sets up OCSP stapling
 type OCSPSettings struct {
-	Period    string
-	Responder string // optional responder
+	Period             string
+	Responder          string // optional responder
+	SkipSignatureCheck bool
 }
 
 func (o *OCSPSettings) RefreshPeriod() (time.Duration, error) {

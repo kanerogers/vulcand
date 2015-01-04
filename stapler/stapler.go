@@ -21,10 +21,38 @@ import (
 )
 
 type Stapler interface {
-	StapleHost(host *engine.Host) ([]byte, error)
+	StapleHost(host *engine.Host) (*StapleResponse, error)
 	DeleteHost(host engine.HostKey)
 	Subscribe(chan *StapleUpdated, chan struct{})
 	Close()
+}
+
+type StaplerOption func(s *stapler) error
+
+func Clock(clock timetools.TimeProvider) StaplerOption {
+	return func(s *stapler) error {
+		s.clock = clock
+		return nil
+	}
+}
+
+func New(opts ...StaplerOption) (Stapler, error) {
+	s := &stapler{
+		v:           make(map[string]*hostStapler),
+		mtx:         &sync.Mutex{},
+		eventsC:     make(chan *stapleFetched),
+		closeC:      make(chan struct{}),
+		subscribers: make(map[int32]chan *StapleUpdated),
+	}
+	for _, o := range opts {
+		if err := o(s); err != nil {
+			return nil, err
+		}
+	}
+	if s.clock == nil {
+		s.clock = &timetools.RealTime{}
+	}
+	return s, nil
 }
 
 type stapler struct {
@@ -181,9 +209,9 @@ func (s *stapler) setStapler(host *engine.Host, re *hostStapler) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	re, ok := s.v[host.Name]
+	other, ok := s.v[host.Name]
 	if ok {
-		re.stop()
+		other.stop()
 	}
 	s.v[host.Name] = re
 }
@@ -280,9 +308,10 @@ func newHostStapler(s *stapler, host *engine.Host) (*hostStapler, error) {
 		host:   host,
 		s:      s,
 		period: period,
+		stopC:  make(chan struct{}),
 	}
 
-	re, err := getStaple(host.Settings.KeyPair)
+	re, err := getStaple(&host.Settings)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +326,7 @@ func newHostStapler(s *stapler, host *engine.Host) (*hostStapler, error) {
 }
 
 func (hs *hostStapler) stop() {
+	log.Infof("Stopping %v", hs)
 	hs.timer.Stop()
 	close(hs.stopC)
 }
@@ -307,7 +337,7 @@ func (hs *hostStapler) String() string {
 
 func (hs *hostStapler) update() {
 	log.Infof("%v about to update", hs)
-	re, err := getStaple(hs.host.Settings.KeyPair)
+	re, err := getStaple(&hs.host.Settings)
 	log.Infof("%v got %v %v", hs, re, err)
 	hs.s.eventsC <- &stapleFetched{id: hs.id, hostName: hs.host.Name, re: re, err: err}
 }
@@ -335,10 +365,15 @@ func (hs *hostStapler) schedule(nextUpdate time.Time) error {
 	return nil
 }
 
-func getStaple(kp *engine.KeyPair) (*StapleResponse, error) {
+func getStaple(s *engine.HostSettings) (*StapleResponse, error) {
+	kp := s.KeyPair
 	cert, err := tls.X509KeyPair(kp.Cert, kp.Key)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(cert.Certificate) < 2 {
+		return nil, fmt.Errorf("Need at least leaf and peer certificate")
 	}
 
 	xc, err := x509.ParseCertificate(cert.Certificate[0])
@@ -357,26 +392,34 @@ func getStaple(kp *engine.KeyPair) (*StapleResponse, error) {
 	}
 
 	log.Infof("Provided some servers: %v", xc.OCSPServer)
-	var re *ocsp.Response
-	var raw []byte
-	if len(xc.OCSPServer) == 0 {
+
+	servers := xc.OCSPServer
+	if s.OCSP.Responder != "" {
+		servers = []string{s.OCSP.Responder}
+	}
+
+	if len(servers) == 0 {
 		return nil, fmt.Errorf("No OCSP servers specified")
 	}
 
-	for _, s := range xc.OCSPServer {
+	var re *ocsp.Response
+	var raw []byte
+	for _, srv := range servers {
 		log.Infof("OCSP about to query: %v for OCSP", s)
-		re, raw, err = getOCSPResponse(s, data, xi)
+		issuer := xi
+		if s.OCSP.SkipSignatureCheck {
+			log.Warningf("Bypassing signature check")
+			// this will bypass signature check
+			issuer = nil
+		}
+		re, raw, err = getOCSPResponse(srv, data, issuer)
 		if err != nil {
 			log.Errorf("Failed to get OCSP response: %v", err)
 			continue
 		}
 		break
 	}
-	log.Infof("OCSP Status: %v, next update: %v", re.Status, re.NextUpdate)
-	if err := re.CheckSignatureFrom(xi); err != nil {
-		log.Errorf("OCSP signature check failed for %v, err: %v", err)
-		return nil, err
-	}
+	log.Infof("OCSP Status: %v, this update: %v, next update: %v", re.Status, re.ThisUpdate, re.NextUpdate)
 	return &StapleResponse{Response: re, Staple: raw}, nil
 }
 
@@ -384,7 +427,7 @@ func getOCSPResponse(server string, request []byte, issuer *x509.Certificate) (*
 	client := &http.Client{}
 	httpReq, err := http.NewRequest("POST", server, bytes.NewReader(request))
 	httpReq.Header.Add("Content-Type", "application/ocsp-request")
-	httpReq.Header.Add("Accept", "application/ocsp-hostStapler")
+	httpReq.Header.Add("Accept", "application/ocsp-response")
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, nil, err
