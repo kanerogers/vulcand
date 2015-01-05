@@ -44,6 +44,7 @@ func New(opts ...StaplerOption) (Stapler, error) {
 		closeC:      make(chan struct{}),
 		subscribers: make(map[int32]chan *StapleUpdated),
 		kickC:       make(chan bool),
+		discardC:    nil,
 	}
 	for _, o := range opts {
 		if err := o(s); err != nil {
@@ -65,6 +66,7 @@ type stapler struct {
 	cnt         int32
 	closeC      chan struct{}
 	kickC       chan bool
+	discardC    chan bool // channel for test purposes
 	subscribers map[int32]chan *StapleUpdated
 }
 
@@ -235,7 +237,8 @@ func (s *stapler) updateStaple(e *stapleFetched) bool {
 	if e.err != nil {
 		log.Errorf("%v failed to fetch staple response for %v, error: %v", s, hs, e.err)
 		if hs.response.Response.NextUpdate.Before(hs.s.clock.UtcNow()) {
-			log.Errorf("%v retry attempts exceeded, invalidating staple %v", s, hs)
+			log.Errorf("%v Now: %v, next: %v retry attempts exceeded, invalidating staple %v",
+				s, hs.s.clock.UtcNow(), hs.response.Response.NextUpdate, hs)
 			delete(s.v, e.hostName)
 			return true
 		}
@@ -274,6 +277,10 @@ func (s *stapler) fanOut() {
 			log.Infof("%v got event %v", s, e)
 			if !s.updateStaple(e) {
 				log.Infof("%v event %v discarded", s, e)
+				// notify tests that the event has been discarded
+				if s.discardC != nil {
+					s.discardC <- true
+				}
 				continue
 			}
 			u := &StapleUpdated{

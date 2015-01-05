@@ -145,7 +145,7 @@ func (s *StaplerSuite) TestUpdateStapleResult(c *C) {
 	case update = <-events:
 		c.Assert(update, NotNil)
 		c.Assert(update.Staple.IsValid(), Equals, true)
-	case <-time.After(10 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 		c.Fatalf("timeout waiting for update")
 	}
 }
@@ -181,7 +181,7 @@ func (s *StaplerSuite) TestFanOutUnsubscribe(c *C) {
 		select {
 		case update := <-ch:
 			c.Assert(update, NotNil)
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 			c.Fatalf("timeout waiting for update")
 		}
 	}
@@ -193,13 +193,16 @@ func (s *StaplerSuite) TestFanOutUnsubscribe(c *C) {
 	select {
 	case update := <-events2:
 		c.Assert(update, NotNil)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 		c.Fatalf("timeout waiting for update")
 	}
 }
 
 // Responder became unavailable after series of retries
 func (s *StaplerSuite) TestResponderUnavailable(c *C) {
+	// we are setting up discard channel that will be used by Stapler to notify about discard events
+	s.st.discardC = make(chan bool)
+
 	srv := newResponder()
 
 	h, err := engine.NewHost("localhost",
@@ -219,6 +222,18 @@ func (s *StaplerSuite) TestResponderUnavailable(c *C) {
 	c.Assert(re.Response.Status, Equals, ocsp.Good)
 
 	srv.Close()
+
+	// The first update did not generate any events, as the time for the next update has not passed
+	s.clock.CurrentTime = s.re.NextUpdate.Add(-1 * time.Hour)
+	s.st.kickC <- true
+
+	// The server discarded the event because the server is unreachable
+	select {
+	case <-s.st.discardC:
+	case <-time.After(100 * time.Millisecond):
+		c.Fatalf("timeout waiting for discard")
+	}
+
 	s.clock.CurrentTime = s.re.NextUpdate.Add(time.Hour)
 	s.st.kickC <- true
 
@@ -227,7 +242,7 @@ func (s *StaplerSuite) TestResponderUnavailable(c *C) {
 	case update = <-events:
 		c.Assert(update, NotNil)
 		c.Assert(update.Err, NotNil)
-	case <-time.After(10 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 		c.Fatalf("timeout waiting for update")
 	}
 }
