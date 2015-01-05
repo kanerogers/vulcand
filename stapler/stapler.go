@@ -137,6 +137,8 @@ func (s *stapler) unsubscribe(id int32) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
+	log.Infof("%v unsubscribed %d", s, id)
+
 	delete(s.subscribers, id)
 }
 
@@ -225,14 +227,14 @@ func (s *stapler) updateStaple(e *stapleFetched) bool {
 
 	hs, ok := s.v[e.hostName]
 	if !ok || hs.id != e.id {
+		log.Infof("%v: %v replaced or removed", s, hs)
 		// this means that it was replaced or removed
 		return false
 	}
-	hs.response = e.re
 
 	if e.err != nil {
-		log.Errorf("Failed to fetch staple response for %v, error: %v", e.err)
-		if hs.s.clock.UtcNow().After(hs.userUpdate(hs.response.Response.NextUpdate)) {
+		log.Errorf("%v failed to fetch staple response for %v, error: %v", s, hs, e.err)
+		if hs.response.Response.NextUpdate.Before(hs.s.clock.UtcNow()) {
 			log.Errorf("%v retry attempts exceeded, invalidating staple %v", s, hs)
 			delete(s.v, e.hostName)
 			return true
@@ -240,6 +242,8 @@ func (s *stapler) updateStaple(e *stapleFetched) bool {
 		hs.schedule(hs.s.clock.UtcNow().Add(ErrRetryPeriod))
 		return false
 	}
+
+	hs.response = e.re
 
 	switch e.re.Response.Status {
 	case ocsp.Good:
@@ -260,28 +264,30 @@ func (s *stapler) String() string {
 }
 
 func (s *stapler) fanOut() {
-	select {
-	case <-s.closeC:
-		log.Infof("%v closing fanOut", s)
-		s.closeSubscribers()
-		return
-	case e := <-s.eventsC:
-		log.Infof("%v got event %v", s, e)
-		if !s.updateStaple(e) {
-			log.Infof("%v event discarded")
+	for {
+		select {
+		case <-s.closeC:
+			log.Infof("%v closing fanOut", s)
+			s.closeSubscribers()
 			return
-		}
-		u := &StapleUpdated{
-			HostKey: engine.HostKey{Name: e.hostName},
-			Staple:  e.re,
-			Err:     e.err,
-		}
-		for id, c := range s.getSubscribers() {
-			select {
-			case c <- u:
-				log.Infof("%v notified %v", s, id)
-			default:
-				log.Infof("%v skipping blocked channel")
+		case e := <-s.eventsC:
+			log.Infof("%v got event %v", s, e)
+			if !s.updateStaple(e) {
+				log.Infof("%v event %v discarded", s, e)
+				continue
+			}
+			u := &StapleUpdated{
+				HostKey: engine.HostKey{Name: e.hostName},
+				Staple:  e.re,
+				Err:     e.err,
+			}
+			for id, c := range s.getSubscribers() {
+				select {
+				case c <- u:
+					log.Infof("%v notified %v", s, id)
+				default:
+					log.Infof("%v skipping blocked channel")
+				}
 			}
 		}
 	}
@@ -299,6 +305,10 @@ type stapleFetched struct {
 	hostName string
 	re       *StapleResponse
 	err      error
+}
+
+func (f *stapleFetched) String() string {
+	return fmt.Sprintf("stapleFetched(hs=%v, host=%v, re=%v, err=%v)", f.id, f.hostName, f.re, f.err)
 }
 
 func (s *StapleUpdated) String() string {
@@ -355,6 +365,11 @@ func (hs *hostStapler) update() {
 func (hs *hostStapler) userUpdate(nextUpdate time.Time) time.Time {
 	now := hs.s.clock.UtcNow()
 	userUpdate := now.Add(hs.period)
+	// nextUpdate may have been not set for the staple response at all
+	if nextUpdate.Before(hs.s.clock.UtcNow()) {
+		return userUpdate
+	}
+	// choose the check that comes first
 	if userUpdate.After(nextUpdate) {
 		return nextUpdate
 	}
@@ -405,12 +420,12 @@ func getStaple(s *engine.HostSettings) (*StapleResponse, error) {
 		return nil, err
 	}
 	servers := xc.OCSPServer
-	if s.OCSP.Responder != "" {
-		servers = []string{s.OCSP.Responder}
+	if len(s.OCSP.Responders) != 0 {
+		servers = s.OCSP.Responders
 	}
 
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("No OCSP servers specified")
+		return nil, fmt.Errorf("No OCSP responders specified")
 	}
 
 	var re *ocsp.Response
@@ -428,7 +443,16 @@ func getStaple(s *engine.HostSettings) (*StapleResponse, error) {
 			log.Errorf("Failed to get OCSP response: %v", err)
 			continue
 		}
+		// it's either server failed or
+		if re.Status != ocsp.Good && re.Status != ocsp.Revoked {
+			log.Warningf("Got unsatisfactiory response: %v, try next server", re.Status)
+			continue
+		}
 		break
+	}
+	if err != nil {
+		log.Infof("OCSP fetch error: %v", err)
+		return nil, err
 	}
 	log.Infof("OCSP Status: %v, this update: %v, next update: %v", re.Status, re.ThisUpdate, re.NextUpdate)
 	return &StapleResponse{Response: re, Staple: raw}, nil

@@ -22,6 +22,7 @@ var _ = Suite(&StaplerSuite{})
 type StaplerSuite struct {
 	st    *stapler
 	clock *timetools.FreezedTime
+	re    *ocsp.Response
 }
 
 func (s *StaplerSuite) SetUpSuite(c *C) {
@@ -31,10 +32,11 @@ func (s *StaplerSuite) SetUpSuite(c *C) {
 	c.Assert(err, IsNil)
 	re, err := ocsp.ParseResponse(bytes, nil)
 	c.Assert(err, IsNil)
-	s.clock = &timetools.FreezedTime{CurrentTime: re.ThisUpdate.Add(time.Hour)}
+	s.re = re
 }
 
 func (s *StaplerSuite) SetUpTest(c *C) {
+	s.clock = &timetools.FreezedTime{CurrentTime: s.re.ThisUpdate.Add(time.Hour)}
 	v, err := New(Clock(s.clock))
 	c.Assert(err, IsNil)
 	s.st = v.(*stapler)
@@ -51,7 +53,7 @@ func (s *StaplerSuite) TestCRUD(c *C) {
 	h, err := engine.NewHost("localhost",
 		engine.HostSettings{
 			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
-			OCSP:    &engine.OCSPSettings{Period: "1h", Responder: srv.URL, SkipSignatureCheck: true},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
 		})
 	c.Assert(err, IsNil)
 
@@ -84,7 +86,7 @@ func (s *StaplerSuite) TestUpdateSettings(c *C) {
 	h, err := engine.NewHost("localhost",
 		engine.HostSettings{
 			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
-			OCSP:    &engine.OCSPSettings{Period: "1h", Responder: srv.URL, SkipSignatureCheck: true},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
 		})
 	c.Assert(err, IsNil)
 
@@ -99,7 +101,7 @@ func (s *StaplerSuite) TestUpdateSettings(c *C) {
 	h2, err := engine.NewHost("localhost",
 		engine.HostSettings{
 			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
-			OCSP:    &engine.OCSPSettings{Period: "2h", Responder: srv.URL, SkipSignatureCheck: true},
+			OCSP:    &engine.OCSPSettings{Period: "2h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
 		})
 	c.Assert(err, IsNil)
 
@@ -115,7 +117,7 @@ func (s *StaplerSuite) TestUpdateSettings(c *C) {
 	c.Assert(id2, Not(Equals), id)
 }
 
-// Periodic update updated the staple value
+// Periodic update updated the staple value, we got the notification
 func (s *StaplerSuite) TestUpdateStapleResult(c *C) {
 	srv := newResponder()
 	defer srv.Close()
@@ -123,7 +125,7 @@ func (s *StaplerSuite) TestUpdateStapleResult(c *C) {
 	h, err := engine.NewHost("localhost",
 		engine.HostSettings{
 			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
-			OCSP:    &engine.OCSPSettings{Period: "1h", Responder: srv.URL, SkipSignatureCheck: true},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
 		})
 	c.Assert(err, IsNil)
 
@@ -142,9 +144,129 @@ func (s *StaplerSuite) TestUpdateStapleResult(c *C) {
 	select {
 	case update = <-events:
 		c.Assert(update, NotNil)
+		c.Assert(update.Staple.IsValid(), Equals, true)
 	case <-time.After(10 * time.Millisecond):
 		c.Fatalf("timeout waiting for update")
 	}
+}
+
+func (s *StaplerSuite) TestFanOutUnsubscribe(c *C) {
+	srv := newResponder()
+	defer srv.Close()
+
+	h, err := engine.NewHost("localhost",
+		engine.HostSettings{
+			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
+		})
+	c.Assert(err, IsNil)
+
+	events := make(chan *StapleUpdated, 1)
+	closeC := make(chan struct{})
+	go s.st.Subscribe(events, closeC)
+
+	events2 := make(chan *StapleUpdated, 1)
+	closeC2 := make(chan struct{})
+	go s.st.Subscribe(events2, closeC2)
+
+	re, err := s.st.StapleHost(h)
+	c.Assert(err, IsNil)
+	c.Assert(re, NotNil)
+	c.Assert(re.Response.Status, Equals, ocsp.Good)
+
+	s.st.kickC <- true
+
+	// both channels got the update
+	for _, ch := range []chan *StapleUpdated{events, events2} {
+		select {
+		case update := <-ch:
+			c.Assert(update, NotNil)
+		case <-time.After(50 * time.Millisecond):
+			c.Fatalf("timeout waiting for update")
+		}
+	}
+
+	// unsubscribe first channel, second will still get the notification
+	close(closeC)
+
+	s.st.kickC <- true
+	select {
+	case update := <-events2:
+		c.Assert(update, NotNil)
+	case <-time.After(50 * time.Millisecond):
+		c.Fatalf("timeout waiting for update")
+	}
+}
+
+// Responder became unavailable after series of retries
+func (s *StaplerSuite) TestResponderUnavailable(c *C) {
+	srv := newResponder()
+
+	h, err := engine.NewHost("localhost",
+		engine.HostSettings{
+			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
+		})
+	c.Assert(err, IsNil)
+
+	events := make(chan *StapleUpdated, 1)
+	close := make(chan struct{})
+	go s.st.Subscribe(events, close)
+
+	re, err := s.st.StapleHost(h)
+	c.Assert(err, IsNil)
+	c.Assert(re, NotNil)
+	c.Assert(re.Response.Status, Equals, ocsp.Good)
+
+	srv.Close()
+	s.clock.CurrentTime = s.re.NextUpdate.Add(time.Hour)
+	s.st.kickC <- true
+
+	var update *StapleUpdated
+	select {
+	case update = <-events:
+		c.Assert(update, NotNil)
+		c.Assert(update.Err, NotNil)
+	case <-time.After(10 * time.Millisecond):
+		c.Fatalf("timeout waiting for update")
+	}
+}
+
+func (s *StaplerSuite) TestStopInFlightTimers(c *C) {
+	srv := newResponder()
+	defer srv.Close()
+
+	h, err := engine.NewHost("localhost",
+		engine.HostSettings{
+			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
+		})
+	c.Assert(err, IsNil)
+
+	events := make(chan *StapleUpdated, 1)
+	close := make(chan struct{})
+	go s.st.Subscribe(events, close)
+
+	re, err := s.st.StapleHost(h)
+	c.Assert(err, IsNil)
+	c.Assert(re, NotNil)
+	c.Assert(re.Response.Status, Equals, ocsp.Good)
+}
+
+func (s *StaplerSuite) TestStapleFailed(c *C) {
+	srv := newResponder()
+	srv.Close()
+
+	h, err := engine.NewHost("localhost",
+		engine.HostSettings{
+			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responders: []string{srv.URL}, SkipSignatureCheck: true},
+		})
+	c.Assert(err, IsNil)
+
+	re, err := s.st.StapleHost(h)
+	c.Assert(err, NotNil)
+	c.Assert(re, IsNil)
 }
 
 func (s *StaplerSuite) TestBadArguments(c *C) {
