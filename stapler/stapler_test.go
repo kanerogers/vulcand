@@ -2,11 +2,14 @@ package stapler
 
 import (
 	"encoding/hex"
+	"golang.org/x/crypto/ocsp"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mailgun/vulcand/Godeps/_workspace/src/github.com/mailgun/log"
+	"github.com/mailgun/vulcand/Godeps/_workspace/src/github.com/mailgun/timetools"
 	"github.com/mailgun/vulcand/engine"
 
 	. "github.com/mailgun/vulcand/Godeps/_workspace/src/gopkg.in/check.v1"
@@ -17,15 +20,22 @@ func TestStapler(t *testing.T) { TestingT(t) }
 var _ = Suite(&StaplerSuite{})
 
 type StaplerSuite struct {
-	st *stapler
+	st    *stapler
+	clock *timetools.FreezedTime
 }
 
 func (s *StaplerSuite) SetUpSuite(c *C) {
 	log.Init([]*log.LogConfig{&log.LogConfig{Name: "console"}})
+	// initialize clock to OCSP response current update:
+	bytes, err := hex.DecodeString(ocspResponseHex)
+	c.Assert(err, IsNil)
+	re, err := ocsp.ParseResponse(bytes, nil)
+	c.Assert(err, IsNil)
+	s.clock = &timetools.FreezedTime{CurrentTime: re.ThisUpdate.Add(time.Hour)}
 }
 
 func (s *StaplerSuite) SetUpTest(c *C) {
-	v, err := New()
+	v, err := New(Clock(s.clock))
 	c.Assert(err, IsNil)
 	s.st = v.(*stapler)
 }
@@ -34,13 +44,8 @@ func (s *StaplerSuite) TearDownTest(c *C) {
 	s.st.Close()
 }
 
-func (s *StaplerSuite) TestSimple(c *C) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bytes, err := hex.DecodeString(ocspResponseHex)
-		c.Assert(err, IsNil)
-		w.Header().Set("Content-Type", "ocsp-response")
-		w.Write(bytes)
-	}))
+func (s *StaplerSuite) TestCRUD(c *C) {
+	srv := newResponder()
 	defer srv.Close()
 
 	h, err := engine.NewHost("localhost",
@@ -53,6 +58,113 @@ func (s *StaplerSuite) TestSimple(c *C) {
 	re, err := s.st.StapleHost(h)
 	c.Assert(err, IsNil)
 	c.Assert(re, NotNil)
+
+	c.Assert(re.Response.Status, Equals, ocsp.Good)
+
+	// subsequent call will return cached response
+	other, err := s.st.StapleHost(h)
+	c.Assert(err, IsNil)
+	c.Assert(re, NotNil)
+	c.Assert(other, Equals, re)
+
+	// delete host
+	hk := engine.HostKey{Name: h.Name}
+	s.st.DeleteHost(hk)
+	c.Assert(len(s.st.v), Equals, 0)
+
+	// second call succeeds
+	s.st.DeleteHost(hk)
+}
+
+// Update of the settings re-initializes staple
+func (s *StaplerSuite) TestUpdateSettings(c *C) {
+	srv := newResponder()
+	defer srv.Close()
+
+	h, err := engine.NewHost("localhost",
+		engine.HostSettings{
+			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responder: srv.URL, SkipSignatureCheck: true},
+		})
+	c.Assert(err, IsNil)
+
+	re, err := s.st.StapleHost(h)
+	c.Assert(err, IsNil)
+	c.Assert(re, NotNil)
+
+	c.Assert(re.Response.Status, Equals, ocsp.Good)
+
+	id := s.st.v[h.Name].id
+
+	h2, err := engine.NewHost("localhost",
+		engine.HostSettings{
+			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
+			OCSP:    &engine.OCSPSettings{Period: "2h", Responder: srv.URL, SkipSignatureCheck: true},
+		})
+	c.Assert(err, IsNil)
+
+	re2, err := s.st.StapleHost(h2)
+	c.Assert(err, IsNil)
+	c.Assert(re2, NotNil)
+	c.Assert(re2.Response.Status, Equals, ocsp.Good)
+
+	// the host stapler has been updated
+	id2 := s.st.v[h.Name].id
+
+	c.Assert(re2, Not(Equals), re)
+	c.Assert(id2, Not(Equals), id)
+}
+
+// Periodic update updated the staple value
+func (s *StaplerSuite) TestUpdateStapleResult(c *C) {
+	srv := newResponder()
+	defer srv.Close()
+
+	h, err := engine.NewHost("localhost",
+		engine.HostSettings{
+			KeyPair: &engine.KeyPair{Key: localhostKey, Cert: localhostCert},
+			OCSP:    &engine.OCSPSettings{Period: "1h", Responder: srv.URL, SkipSignatureCheck: true},
+		})
+	c.Assert(err, IsNil)
+
+	events := make(chan *StapleUpdated, 1)
+	close := make(chan struct{})
+	go s.st.Subscribe(events, close)
+
+	re, err := s.st.StapleHost(h)
+	c.Assert(err, IsNil)
+	c.Assert(re, NotNil)
+	c.Assert(re.Response.Status, Equals, ocsp.Good)
+
+	s.st.kickC <- true
+
+	var update *StapleUpdated
+	select {
+	case update = <-events:
+		c.Assert(update, NotNil)
+	case <-time.After(10 * time.Millisecond):
+		c.Fatalf("timeout waiting for update")
+	}
+}
+
+func (s *StaplerSuite) TestBadArguments(c *C) {
+	h, err := engine.NewHost("localhost", engine.HostSettings{})
+	c.Assert(err, IsNil)
+
+	re, err := s.st.StapleHost(h)
+	c.Assert(err, NotNil)
+	c.Assert(re, IsNil)
+}
+
+func newResponder() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bytes, err := hex.DecodeString(ocspResponseHex)
+		if err != nil {
+			panic(err)
+		}
+		w.Header().Set("Content-Type", "ocsp-response")
+		w.Write(bytes)
+	}))
 }
 
 var localhostCert = []byte(`-----BEGIN CERTIFICATE-----

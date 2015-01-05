@@ -43,6 +43,7 @@ func New(opts ...StaplerOption) (Stapler, error) {
 		eventsC:     make(chan *stapleFetched),
 		closeC:      make(chan struct{}),
 		subscribers: make(map[int32]chan *StapleUpdated),
+		kickC:       make(chan bool),
 	}
 	for _, o := range opts {
 		if err := o(s); err != nil {
@@ -52,6 +53,7 @@ func New(opts ...StaplerOption) (Stapler, error) {
 	if s.clock == nil {
 		s.clock = &timetools.RealTime{}
 	}
+	go s.fanOut()
 	return s, nil
 }
 
@@ -62,6 +64,7 @@ type stapler struct {
 	eventsC     chan *stapleFetched
 	cnt         int32
 	closeC      chan struct{}
+	kickC       chan bool
 	subscribers map[int32]chan *StapleUpdated
 }
 
@@ -108,7 +111,7 @@ func (s *stapler) Close() {
 		hs.stop()
 		delete(s.v, key)
 	}
-	close(s.eventsC)
+	close(s.closeC)
 }
 
 func (s *stapler) subscribe(c chan *StapleUpdated) int32 {
@@ -252,15 +255,18 @@ func (s *stapler) updateStaple(e *stapleFetched) bool {
 	return true
 }
 
+func (s *stapler) String() string {
+	return fmt.Sprintf("Stapler()")
+}
+
 func (s *stapler) fanOut() {
 	select {
+	case <-s.closeC:
+		log.Infof("%v closing fanOut", s)
+		s.closeSubscribers()
+		return
 	case e := <-s.eventsC:
 		log.Infof("%v got event %v", s, e)
-		if e == nil {
-			log.Infof("%v closed")
-			s.closeSubscribers()
-			return
-		}
 		if !s.updateStaple(e) {
 			log.Infof("%v event discarded")
 			return
@@ -270,9 +276,10 @@ func (s *stapler) fanOut() {
 			Staple:  e.re,
 			Err:     e.err,
 		}
-		for _, c := range s.getSubscribers() {
+		for id, c := range s.getSubscribers() {
 			select {
 			case c <- u:
+				log.Infof("%v notified %v", s, id)
 			default:
 				log.Infof("%v skipping blocked channel")
 			}
@@ -336,10 +343,13 @@ func (hs *hostStapler) String() string {
 }
 
 func (hs *hostStapler) update() {
-	log.Infof("%v about to update", hs)
 	re, err := getStaple(&hs.host.Settings)
 	log.Infof("%v got %v %v", hs, re, err)
-	hs.s.eventsC <- &stapleFetched{id: hs.id, hostName: hs.host.Name, re: re, err: err}
+	select {
+	case hs.s.eventsC <- &stapleFetched{id: hs.id, hostName: hs.host.Name, re: re, err: err}:
+	case <-hs.stopC:
+		log.Infof("%v stopped", hs)
+	}
 }
 
 func (hs *hostStapler) userUpdate(nextUpdate time.Time) time.Time {
@@ -352,11 +362,15 @@ func (hs *hostStapler) userUpdate(nextUpdate time.Time) time.Time {
 }
 
 func (hs *hostStapler) schedule(nextUpdate time.Time) error {
-	log.Infof("%v schedule update for %v", nextUpdate)
+	log.Infof("%v schedule update for %v", hs, nextUpdate)
 	hs.timer = time.NewTimer(nextUpdate.Sub(hs.s.clock.UtcNow()))
 	go func() {
 		select {
 		case <-hs.timer.C:
+			log.Infof("%v update by timer", hs)
+			hs.update()
+		case <-hs.s.kickC:
+			log.Infof("%v update by kick channel", hs)
 			hs.update()
 		case <-hs.stopC:
 			log.Infof("%v stopped", hs)
@@ -390,9 +404,6 @@ func getStaple(s *engine.HostSettings) (*StapleResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	log.Infof("Provided some servers: %v", xc.OCSPServer)
-
 	servers := xc.OCSPServer
 	if s.OCSP.Responder != "" {
 		servers = []string{s.OCSP.Responder}
@@ -405,7 +416,7 @@ func getStaple(s *engine.HostSettings) (*StapleResponse, error) {
 	var re *ocsp.Response
 	var raw []byte
 	for _, srv := range servers {
-		log.Infof("OCSP about to query: %v for OCSP", s)
+		log.Infof("OCSP about to query: %v for OCSP", srv)
 		issuer := xi
 		if s.OCSP.SkipSignatureCheck {
 			log.Warningf("Bypassing signature check")
